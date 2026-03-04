@@ -1,84 +1,147 @@
-import processor
 import os
 import glob
 import json
-import database
-import indexer
+import operator
 from pathlib import Path
+from typing import List, Annotated, Set
+
+# LangChain / LangGraph Imports
+from langchain_core.messages import HumanMessage
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_qdrant.fastembed_sparse import FastEmbedSparse
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_ollama import ChatOllama
+from langgraph.graph import MessagesState
+from pydantic import BaseModel, Field
 
-# --- CONFIGURATION ---
+# Local Module Imports
+import processor
+import database
+import indexer
+import prompts
+import tools
+
+# --- 1. STATE HELPERS (Must be at the top) ---
+def accumulate_or_reset(existing: List[dict], new: List[dict]) -> List[dict]:
+    if new and any(item.get('__reset__') for item in new):
+        return []
+    return existing + new
+
+def set_union(a: Set[str], b: Set[str]) -> Set[str]:
+    return a | b
+
+# --- 2. DATA MODELS ---
+class State(MessagesState):
+    questionIsClear: bool = False
+    conversation_summary: str = ""
+    originalQuery: str = ""
+    rewrittenQuestions: List[str] = []
+    agent_answers: Annotated[List[dict], accumulate_or_reset] = []
+
+class AgentState(MessagesState):
+    tool_call_count: Annotated[int, operator.add] = 0
+    iteration_count: Annotated[int, operator.add] = 0
+    question: str = ""
+    context_summary: str = ""
+    final_answer: str = ""
+
+class QueryAnalysis(BaseModel):
+    is_clear: bool = Field(description="Indicates if the user's question is clear.")
+    questions: List[str] = Field(description="List of rewritten questions.")
+    clarification_needed: str = Field(description="Explanation if unclear.")
+
+# --- 3. CONFIGURATION ---
 DOCS_DIR = "docs"
 MARKDOWN_DIR = "markdown"
 PARENT_STORE_PATH = "parent_store"
 CHILD_COLLECTION = "document_child_chunks"
 
-# Ensure Folders Exist
 os.makedirs(DOCS_DIR, exist_ok=True)
 os.makedirs(MARKDOWN_DIR, exist_ok=True)
 os.makedirs(PARENT_STORE_PATH, exist_ok=True)
 
-# --- INITIALIZATION ---
+# --- 4. INITIALIZATION ---
 print("Initializing models and database...")
 database.ensure_collection(CHILD_COLLECTION)
 
-llm = ChatOllama(model="qwen3:4b-instruct-2507-q4_K_M", temperature=0)
+# EMBEDDINGS
 dense_embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
 sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
 
-# --- STEP 1: PDF -> MARKDOWN ---
-print("Checking for PDFs to convert...")
-processor.pdfs_to_markdowns(f"{DOCS_DIR}/*.pdf", MARKDOWN_DIR)
+# VECTOR STORE & LLM
+child_vector_store = database.get_vector_store(CHILD_COLLECTION, dense_embeddings, sparse_embeddings)
+llm = ChatOllama(model="qwen3:4b-instruct-2507-q4_K_M", temperature=0)
 
-# --- STEP 2: INDEXING (The Parent/Child Logic) ---
-def run_indexing():
-    # Setup Splitters
-    headers_to_split_on = [("#", "H1"), ("##", "H2"), ("###", "H3")]
-    parent_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-
-    md_files = glob.glob(f"{MARKDOWN_DIR}/*.md")
-    if not md_files:
-        print("No markdown files found to index.")
-        return
-
-    print(f"Starting indexing for {len(md_files)} files...")
-    
-    for md_path_str in md_files:
-        with open(md_path_str, "r", encoding="utf-8") as f:
-            md_text = f.read()
-
-        # Create Hierarchy using the indexer.py functions
-        raw_parents = parent_splitter.split_text(md_text)
-        merged = indexer.merge_small_parents(raw_parents, 2000)
-        final_parents = indexer.split_large_parents(merged, 4000, 100)
-        
-        for i, p_chunk in enumerate(final_parents):
-            parent_id = f"{Path(md_path_str).stem}_p{i}"
-            p_chunk.metadata.update({"parent_id": parent_id, "source": Path(md_path_str).name})
-            
-            # Save Parent to JSON folder
-            parent_file = os.path.join(PARENT_STORE_PATH, f"{parent_id}.json")
-            with open(parent_file, "w", encoding="utf-8") as f:
-                json.dump({"page_content": p_chunk.page_content, "metadata": p_chunk.metadata}, f)
-
-            # Note: Later we will add the code here to upload children to Qdrant!
-            
-    print("✅ Indexing complete. Parent chunks are stored in 'parent_store'.")
-
-if __name__ == "__main__":
-    run_indexing()
-    print("Project is initialized and database is ready!")
-    
-import tools
-
-# 1. Get the list of tool functions
+# TOOLS (Now child_vector_store is defined, so this works!)
 my_tools = tools.get_tools(child_vector_store, PARENT_STORE_PATH)
-
-# 2. Tell the LLM these tools exist
 llm_with_tools = llm.bind_tools(my_tools)
 
-print(" Tools bound to the LLM. It is now ready to search!")
+# --- 5. NODES ---
+def rewriter_node(state: State):
+    print("---REWRITING QUERY---")
+    system_message = prompts.get_rewrite_query_prompt()
+    user_query = state['messages'][-1].content
+    conv_summary = state.get('conversation_summary', "")
+    
+    llm_structured = llm.with_structured_output(QueryAnalysis)
+    response = llm_structured.invoke([
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": f"Summary: {conv_summary}\nQuery: {user_query}"}
+    ])
+    return {"rewrittenQuestions": response.questions, "questionIsClear": response.is_clear}
+
+def researcher_node(state: AgentState):
+    print(f"---RESEARCHER ITERATION {state.get('iteration_count', 0)}---")
+    system_prompt = prompts.get_orchestrator_prompt()
+    input_text = f"Question: {state['question']}\nContext: {state.get('context_summary', '')}"
+    
+    response = llm_with_tools.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": input_text}
+    ])
+    return {"messages": [response], "iteration_count": 1}
+
+# --- 6. INDEXING LOGIC ---
+def run_indexing():
+    # ... (Keep your existing run_indexing code here) ...
+    pass
+
+# --- 7. MAIN EXECUTION ---
+'''if __name__ == "__main__":
+    # Your choice logic here
+    print("Project initialized. Ready for indexing or agent execution.")'''
+    
+if __name__ == "__main__":
+    print("\n--- 🧪 STARTING LOCAL TEST ---")
+    
+    # --- TEST 1: Query Rewriting ---
+    # We use HumanMessage because the rewriter_node expects state['messages'][-1].content
+    test_state = {
+        "messages": [HumanMessage(content="Tell me about the project budget")],
+        "conversation_summary": "The user is asking about financial documents."
+    }
+    
+    print("\nTesting Rewriter Node...")
+    try:
+        rewrite_result = rewriter_node(test_state)
+        print(f"✅ Rewriter Output: {rewrite_result['rewrittenQuestions']}")
+        print(f"✅ Question Clear: {rewrite_result['questionIsClear']}")
+    except Exception as e:
+        print(f"❌ Rewriter Failed: {e}")
+
+    # --- TEST 2: Tool Access ---
+    print("\nTesting LLM Tool Binding...")
+    # This forces the LLM to decide if it needs a tool
+    try:
+        test_query = "Search the documents for 'budget' using your tools."
+        test_response = llm_with_tools.invoke([HumanMessage(content=test_query)])
+        
+        if test_response.tool_calls:
+            print(f"✅ SUCCESS: LLM identified tool: {test_response.tool_calls[0]['name']}")
+            print(f"Tool Arguments: {test_response.tool_calls[0]['args']}")
+        else:
+            print("❌ FAILURE: LLM did not call any tools. Check your tool binding in main.py.")
+    except Exception as e:
+        print(f"❌ Tool Test Failed: {e}")
+
+    print("\n--- 🧪 TEST COMPLETE ---")
