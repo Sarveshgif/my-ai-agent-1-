@@ -23,33 +23,42 @@ import tools
 
 # --- 1. STATE HELPERS (Must be at the top) ---
 def accumulate_or_reset(existing: List[dict], new: List[dict]) -> List[dict]:
+    """Allows the agent to clear its memory if a '__reset__' flag is found."""
     if new and any(item.get('__reset__') for item in new):
         return []
     return existing + new
 
 def set_union(a: Set[str], b: Set[str]) -> Set[str]:
+    """Merges sets of retrieval keys to avoid duplicate searches."""
     return a | b
 
 # --- 2. DATA MODELS ---
 class State(MessagesState):
+    """The global state for the entire conversation."""
     questionIsClear: bool = False
     conversation_summary: str = ""
     originalQuery: str = ""
     rewrittenQuestions: List[str] = []
+    # Uses the accumulator function defined above
     agent_answers: Annotated[List[dict], accumulate_or_reset] = []
 
 class AgentState(MessagesState):
+    """The local state used during the iterative research loop."""
     tool_call_count: Annotated[int, operator.add] = 0
     iteration_count: Annotated[int, operator.add] = 0
     question: str = ""
+    question_index: int = 0
     context_summary: str = ""
+    retrieval_keys: Annotated[Set[str], set_union] = set()
     final_answer: str = ""
+    agent_answers: List[dict] = []
 
 class QueryAnalysis(BaseModel):
-    is_clear: bool = Field(description="Indicates if the user's question is clear.")
-    questions: List[str] = Field(description="List of rewritten questions.")
-    clarification_needed: str = Field(description="Explanation if unclear.")
-
+    """Structured output for the Rewriter Node."""
+    is_clear: bool = Field(description="Indicates if the user's question is clear and answerable.")
+    questions: List[str] = Field(description="List of rewritten, self-contained questions.")
+    clarification_needed: str = Field(description="Explanation if the question is unclear.")
+    
 # --- 3. CONFIGURATION ---
 DOCS_DIR = "docs"
 MARKDOWN_DIR = "markdown"
@@ -70,7 +79,7 @@ sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
 
 # VECTOR STORE & LLM
 child_vector_store = database.get_vector_store(CHILD_COLLECTION, dense_embeddings, sparse_embeddings)
-llm = ChatOllama(model="qwen3:4b-instruct-2507-q4_K_M", temperature=0)
+llm = ChatOllama(model="qwen2.5:3b", temperature=0)
 
 # TOOLS (Now child_vector_store is defined, so this works!)
 my_tools = tools.get_tools(child_vector_store, PARENT_STORE_PATH)
