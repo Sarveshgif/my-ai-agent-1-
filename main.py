@@ -4,6 +4,7 @@ import json
 import operator
 from pathlib import Path
 from typing import List, Annotated, Set
+import tiktoken
 
 # LangChain / LangGraph Imports
 from langchain_core.messages import HumanMessage
@@ -20,6 +21,26 @@ import database
 import indexer
 import prompts
 import tools
+
+#AGENT CONFIGURATION
+MAX_TOOL_CALLS = 8       # Stops the agent if it gets "confused"
+MAX_ITERATIONS = 10      # Maximum loops before giving up
+BASE_TOKEN_THRESHOLD = 2000     
+TOKEN_GROWTH_FACTOR = 0.9
+
+def estimate_context_tokens(messages: list) -> int:
+    """Calculates how much 'brain space' the conversation is taking up."""
+    try:
+        # We use cl100k_base because it's the standard for most modern LLMs (including Qwen)
+        encoding = tiktoken.get_encoding("cl100k_base")
+    except:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    
+    total_tokens = 0
+    for msg in messages:
+        if hasattr(msg, 'content') and msg.content:
+            total_tokens += len(encoding.encode(str(msg.content)))
+    return total_tokens
 
 # --- 1. STATE HELPERS (Must be at the top) ---
 def accumulate_or_reset(existing: List[dict], new: List[dict]) -> List[dict]:
